@@ -75,7 +75,7 @@ export async function warmupRefundsCache(
       ),
     ]);
 
-    refundsCache.set('all', result);
+    refundsCache.set('admin:all', result);
 
     const durationMs = Date.now() - started;
     logger.info(`[refundsCache] warmup completed in ${durationMs}ms — 1 entry loaded`);

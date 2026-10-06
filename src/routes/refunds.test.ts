@@ -287,6 +287,7 @@ describe('POST /api/refunds', () => {
 describe('GET /api/refunds', () => {
   beforeEach(() => {
     clearRefundStore();
+    process.env.ADMIN_API_KEY = 'test-admin-key';
   });
 
   it('200 - returns empty array when no requests exist', async () => {
@@ -486,6 +487,162 @@ describe('GET /api/refunds', () => {
     expect(res.body.meta.total).toBe(5);
     expect(res.body.meta.limit).toBe(2);
     expect(res.body.meta.offset).toBe(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #1256: user/admin REFUNDED dispute access & cache isolation
+  // ---------------------------------------------------------------------------
+
+  it('200 - admin sees all REFUNDED disputes', async () => {
+    const app = createTestApp();
+
+    // Create refunds for two different developers
+    await request(app)
+      .post('/api/refunds')
+      .set('x-user-id', 'dev-1')
+      .send(validBody);
+
+    const r2 = await request(app)
+      .post('/api/refunds')
+      .set('x-user-id', 'dev-2')
+      .send({ usageEventId: '123e4567-e89b-12d3-a456-426614174002', reason: 'Other developer refund request', amountUsdc: '25.00' });
+
+    // Resolve both as REFUNDED
+    const store = getRefundStore();
+    const r1 = store.get(r2.body.data.id);
+    if (r1) {
+      r1.status = 'REFUNDED';
+      r1.resolvedAt = new Date();
+      r1.resolvedBy = 'admin-1';
+    }
+    if (r2) {
+      r2.status = 'REFUNDED';
+      r2.resolvedAt = new Date();
+      r2.resolvedBy = 'admin-1';
+    }
+
+    // Admin sees all REFUNDED disputes
+    const res = await request(app)
+      .get('/api/refunds')
+      .set('x-user-id', 'dev-1')
+      .set('x-admin-api-key', 'test-admin-key');
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(2);
+    expect(res.body.meta.total).toBe(2);
+    res.body.data.forEach((d: { developerId: string }) => {
+      expect(d.status).toBe('REFUNDED');
+    });
+  });
+
+  it('200 - user sees only their own REFUNDED disputes', async () => {
+    const app = createTestApp();
+
+    // Create refunds for two different developers
+    await request(app)
+      .post('/api/refunds')
+      .set('x-user-id', 'dev-1')
+      .send(validBody);
+
+    const r2Create = await request(app)
+      .post('/api/refunds')
+      .set('x-user-id', 'dev-2')
+      .send({ usageEventId: '123e4567-e89b-12d3-a456-426614174002', reason: 'Other developer refund request', amountUsdc: '25.00' });
+
+    // Resolve both as REFUNDED
+    const store = getRefundStore();
+    const r1 = store.get(r2Create.body.data.id);
+    if (r1) {
+      r1.status = 'REFUNDED';
+      r1.resolvedAt = new Date();
+      r1.resolvedBy = 'admin-1';
+    }
+    const r2 = store.get(r2Create.body.data.id);
+    if (r2) {
+      r2.status = 'REFUNDED';
+      r2.resolvedAt = new Date();
+      r2.resolvedBy = 'admin-1';
+    }
+
+    // User sees only their own REFUNDED disputes
+    const res = await request(app)
+      .get('/api/refunds')
+      .set('x-user-id', 'dev-1');
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(1);
+    expect(res.body.data[0].developerId).toBe('dev-1');
+    expect(res.body.data[0].status).toBe('REFUNDED');
+    expect(res.body.meta.total).toBe(1);
+  });
+
+  it('cache scopes are isolated - user and admin caches do not interfere', async () => {
+    const app = createTestApp();
+
+    // Create a refund as dev-1 and resolve as REFUNDED
+    await request(app)
+      .post('/api/refunds')
+      .set('x-user-id', 'dev-1')
+      .send(validBody);
+
+    const store = getRefundStore();
+    const created = store.values().next().value;
+    if (created) {
+      created.status = 'REFUNDED';
+      created.resolvedAt = new Date();
+      created.resolvedBy = 'admin-1';
+    }
+
+    // User dev-1 sees their own REFUNDED dispute
+    let res = await request(app)
+      .get('/api/refunds')
+      .set('x-user-id', 'dev-1');
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(1);
+    expect(res.body.data[0].developerId).toBe('dev-1');
+
+    // Admin sees all REFUNDED disputes
+    res = await request(app)
+      .get('/api/refunds')
+      .set('x-user-id', 'dev-1')
+      .set('x-admin-api-key', 'test-admin-key');
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(1);
+    expect(res.body.data[0].developerId).toBe('dev-1');
+
+    // Create a refund as dev-2 and resolve as REFUNDED
+    await request(app)
+      .post('/api/refunds')
+      .set('x-user-id', 'dev-2')
+      .send({ usageEventId: '123e4567-e89b-12d3-a456-426614174003', reason: 'Dev-2 refund', amountUsdc: '30.00' });
+
+    const store2 = getRefundStore();
+    const created2 = store2.values().next().value;
+    if (created2) {
+      created2.status = 'REFUNDED';
+      created2.resolvedAt = new Date();
+      created2.resolvedBy = 'admin-1';
+    }
+
+    // User dev-1 should still see only their own
+    res = await request(app)
+      .get('/api/refunds')
+      .set('x-user-id', 'dev-1');
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(1);
+    expect(res.body.data[0].developerId).toBe('dev-1');
+
+    // Admin should see both REFUNDED disputes
+    res = await request(app)
+      .get('/api/refunds')
+      .set('x-user-id', 'dev-1')
+      .set('x-admin-api-key', 'test-admin-key');
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(2);
   });
 });
 
@@ -963,4 +1120,171 @@ describe('Tracing spans for /api/refunds', () => {
     const spans = getSpans();
     expect(spans[0].ended).toBe(true);
   });
+});
+  // ---------------------------------------------------------------------------
+  // Issue #1256: user/admin REFUNDED dispute access & cache isolation
+  // ---------------------------------------------------------------------------
+
+  describe("Issue #1256: REFUNDED dispute access & cache isolation", () => {
+  beforeEach(() => {
+    clearRefundStore();
+  });
+
+  it("200 - admin sees all REFUNDED disputes", async () => {
+    const app = createTestApp();
+
+    // Create refunds for two different developers
+    await request(app)
+      .post("/api/refunds")
+      .set("x-user-id", "dev-1")
+      .send(validBody);
+
+    const r2Create = await request(app)
+      .post("/api/refunds")
+      .set("x-user-id", "dev-2")
+      .send({ usageEventId: "123e4567-e89b-12d3-a456-426614174002", reason: "Other developer refund request", amountUsdc: "25.00" });
+
+    // Resolve both as REFUNDED
+    const store = getRefundStore();
+    const dev1Id = store.keys().next().value;
+    const r1 = store.get(dev1Id);
+    if (r1) {
+      r1.status = "REFUNDED";
+      r1.resolvedAt = new Date();
+      r1.resolvedBy = "admin-1";
+    }
+    const r2 = store.get(r2Create.body.data.id);
+    if (r2) {
+      r2.status = "REFUNDED";
+      r2.resolvedAt = new Date();
+      r2.resolvedBy = "admin-1";
+    }
+
+    // Admin sees all REFUNDED disputes
+    const res = await request(app)
+      .get("/api/refunds")
+      .set("x-user-id", "dev-1")
+      .set("x-admin-api-key", "test-admin-key");
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(2);
+    expect(res.body.meta.total).toBe(2);
+    res.body.data.forEach((d: { status: string }) => {
+      expect(d.status).toBe("REFUNDED");
+    });
+  });
+
+  it("200 - user sees only their own REFUNDED disputes", async () => {
+    const app = createTestApp();
+
+    // Create refunds for two different developers
+    await request(app)
+      .post("/api/refunds")
+      .set("x-user-id", "dev-1")
+      .send(validBody);
+
+    const r2Create = await request(app)
+      .post("/api/refunds")
+      .set("x-user-id", "dev-2")
+      .send({ usageEventId: "123e4567-e89b-12d3-a456-426614174002", reason: "Other developer refund request", amountUsdc: "25.00" });
+
+    // Resolve both as REFUNDED
+    const store = getRefundStore();
+    const dev1Id = store.keys().next().value;
+    const r1 = store.get(dev1Id);
+    if (r1) {
+      r1.status = "REFUNDED";
+      r1.resolvedAt = new Date();
+      r1.resolvedBy = "admin-1";
+    }
+    const r2 = store.get(r2Create.body.data.id);
+    if (r2) {
+      r2.status = "REFUNDED";
+      r2.resolvedAt = new Date();
+      r2.resolvedBy = "admin-1";
+    }
+
+    // User sees only their own REFUNDED disputes
+    const res = await request(app)
+      .get("/api/refunds")
+      .set("x-user-id", "dev-1");
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(1);
+    expect(res.body.data[0].developerId).toBe("dev-1");
+    expect(res.body.data[0].status).toBe("REFUNDED");
+    expect(res.body.meta.total).toBe(1);
+  });
+
+  it("cache scopes are isolated - user and admin caches do not interfere", async () => {
+    const app = createTestApp();
+
+    // Create a refund as dev-1 and resolve as REFUNDED
+    await request(app)
+      .post("/api/refunds")
+      .set("x-user-id", "dev-1")
+      .send(validBody);
+
+    const store = getRefundStore();
+    const dev1Id = store.keys().next().value;
+    const r1 = store.get(dev1Id);
+    if (r1) {
+      r1.status = "REFUNDED";
+      r1.resolvedAt = new Date();
+      r1.resolvedBy = "admin-1";
+    }
+
+    // User dev-1 sees their own REFUNDED dispute
+    let res = await request(app)
+      .get("/api/refunds")
+      .set("x-user-id", "dev-1");
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(1);
+    expect(res.body.data[0].developerId).toBe("dev-1");
+
+    // Admin sees all REFUNDED disputes
+    res = await request(app)
+      .get("/api/refunds")
+      .set("x-user-id", "dev-1")
+      .set("x-admin-api-key", "test-admin-key");
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(1);
+    expect(res.body.data[0].developerId).toBe("dev-1");
+
+    // Create a refund as dev-2 and resolve as REFUNDED
+    await request(app)
+      .post("/api/refunds")
+      .set("x-user-id", "dev-2")
+      .send({ usageEventId: "123e4567-e89b-12d3-a456-426614174003", reason: "Dev-2 refund", amountUsdc: "30.00" });
+
+    const store2 = getRefundStore();
+    const dev2Id = store2.keys().next().value;
+    const r2 = store2.get(dev2Id);
+    if (r2) {
+      r2.status = "REFUNDED";
+      r2.resolvedAt = new Date();
+      r2.resolvedBy = "admin-1";
+    }
+
+    // User dev-1 should still see only their own
+    res = await request(app)
+      .get("/api/refunds")
+      .set("x-user-id", "dev-1");
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(1);
+    expect(res.body.data[0].developerId).toBe("dev-1");
+
+    // Admin should see both REFUNDED disputes
+    res = await request(app)
+      .get("/api/refunds")
+      .set("x-user-id", "dev-1")
+      .set("x-admin-api-key", "test-admin-key");
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toHaveLength(2);
+  });
+
 });
