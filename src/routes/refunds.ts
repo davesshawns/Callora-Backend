@@ -2,8 +2,15 @@ import { Router } from 'express';
 import { defaultDisputeService } from '../services/disputeService.js';
 import { refundsCache } from '../services/refundsCacheWarm.js';
 import { successEnvelope, errorEnvelope, getRequestId } from '../lib/envelope.js';
+import type { ResponseMeta } from '../types/ResponseEnvelope.js';
 
 const router = Router();
+
+function listRefunds(requestId: string, refunds: any, statusFilter?: string): any {
+  const total = refunds.length;
+  const meta: ResponseMeta = { total };
+  return successEnvelope(refunds, requestId, meta);
+}
 
 function authenticateUser(req: Request): string | null {
   const userId = req.header('x-user-id');
@@ -117,11 +124,20 @@ router.post('/', (req, res) => {
 
 router.get('/', (req, res) => {
   const requestId = getRequestId(req);
+  const statusFilter = (req.query.status as string) || undefined;
+
+  if (statusFilter && !['pending', 'approved', 'rejected'].includes(statusFilter)) {
+    res.status(400).json(errorEnvelope('VALIDATION_ERROR', 'Invalid status query param', requestId));
+    return;
+  }
 
   if (authenticateAdmin(req)) {
     const cached = refundsCache.get('admin:all');
     if (cached !== undefined) {
-      res.json(successEnvelope(cached, requestId));
+      const filtered = statusFilter
+        ? cached.filter((d: any) => d.status === statusFilter)
+        : cached;
+      res.json(listRefunds(requestId, filtered, statusFilter));
       return;
     }
 
@@ -129,7 +145,10 @@ router.get('/', (req, res) => {
     const refunds = all.filter((d) => d.status === 'REFUNDED');
     refundsCache.set('admin:all', refunds);
 
-    res.json(successEnvelope(refunds, requestId));
+    const filtered = statusFilter
+      ? refunds.filter((d: any) => d.status === statusFilter)
+      : refunds;
+    res.json(listRefunds(requestId, filtered, statusFilter));
     return;
   }
 
@@ -142,7 +161,10 @@ router.get('/', (req, res) => {
   const cacheKey = `user:${userId}`;
   const cached = refundsCache.get(cacheKey);
   if (cached !== undefined) {
-    res.json(successEnvelope(cached, requestId));
+    const filtered = statusFilter
+      ? cached.filter((d: any) => d.status === statusFilter)
+      : cached;
+    res.json(listRefunds(requestId, filtered, statusFilter));
     return;
   }
 
@@ -150,7 +172,10 @@ router.get('/', (req, res) => {
   const refunds = all.filter((d) => d.status === 'REFUNDED' && d.opened_by === userId);
   refundsCache.set(cacheKey, refunds);
 
-  res.json(successEnvelope(refunds, requestId));
+  const filtered = statusFilter
+    ? refunds.filter((d: any) => d.status === statusFilter)
+    : refunds;
+  res.json(listRefunds(requestId, filtered, statusFilter));
 });
 
 export function getRefundStore() {
